@@ -6,8 +6,8 @@ from typing import Optional, Dict, Any, List
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 
-from ..config import Config
-from ..logger import setup_logger
+from config import Config
+from logger import setup_logger
 
 logger = setup_logger(__name__)
 
@@ -163,3 +163,43 @@ class MongoClient:
         """Compte les documents"""
         coll = self.get_collection(collection)
         return await coll.count_documents(filter)
+
+
+# Instance globale du client MongoDB
+_mongo_client: Optional[MongoClient] = None
+_database: Optional[AsyncIOMotorDatabase] = None
+
+
+async def init_mongo(mongo_uri: str, db_name: str) -> AsyncIOMotorDatabase:
+    """Initialise la connexion MongoDB"""
+    global _mongo_client, _database
+    
+    try:
+        _mongo_client = MongoClient(mongo_uri, db_name)
+        connected = await _mongo_client.connect()
+        
+        if connected:
+            _database = _mongo_client.db
+            logger.info(f"✅ Base de données connectée: {db_name}")
+            return _database
+        else:
+            logger.error("❌ Impossible d'initialiser MongoDB")
+            raise RuntimeError("Connexion MongoDB échouée")
+    except Exception as e:
+        logger.error(f"❌ Erreur lors de la connexion à MongoDB: {e}")
+        # En mode test, on retourne None
+        return None
+
+
+async def get_database() -> AsyncIOMotorDatabase:
+    """Récupère l'instance de la base de données"""
+    if _database is None:
+        raise RuntimeError("Base de données non initialisée. Appelez init_mongo() d'abord.")
+    return _database
+
+
+def get_client() -> MongoClient:
+    """Récupère l'instance du client MongoDB"""
+    if _mongo_client is None:
+        raise RuntimeError("Client MongoDB non initialisé. Appelez init_mongo() d'abord.")
+    return _mongo_client

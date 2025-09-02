@@ -4,7 +4,7 @@ Création des index MongoDB
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pymongo import ASCENDING, DESCENDING, TEXT
-from ..logger import setup_logger
+from logger import setup_logger
 
 logger = setup_logger(__name__)
 
@@ -75,3 +75,8 @@ async def create_indexes(db: AsyncIOMotorDatabase):
     except Exception as e:
         logger.error(f"❌ Erreur lors de la création des index: {e}")
         raise
+
+
+async def ensure_indexes(db: AsyncIOMotorDatabase):
+    """Alias pour create_indexes - assure que les index existent"""
+    await create_indexes(db)

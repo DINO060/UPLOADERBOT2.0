@@ -210,3 +210,81 @@ class PostsRepository:
         except Exception as e:
             logger.error(f"Erreur lors de l'ajout de la réaction: {e}")
             return False
+    
+    async def set_status(
+        self,
+        post_id: str,
+        status: str
+    ) -> bool:
+        """Change le statut d'un post"""
+        try:
+            from bson import ObjectId
+            result = await self.collection.update_one(
+                {"_id": ObjectId(post_id)},
+                {"$set": {"status": status, "updated_at": datetime.utcnow()}}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Erreur lors du changement de statut: {e}")
+            return False
+    
+    async def add_url_button(
+        self,
+        post_id: str,
+        button_text: str,
+        button_url: str,
+        row: int = 0
+    ) -> bool:
+        """Ajoute un bouton URL au post"""
+        try:
+            from bson import ObjectId
+            
+            # Récupère le post actuel
+            post = await self.get_post(post_id)
+            if not post:
+                return False
+            
+            # Prépare le nouveau bouton
+            new_button = {"text": button_text, "url": button_url}
+            
+            # Ajoute le bouton à la ligne spécifiée
+            if row < len(post.inline_buttons):
+                post.inline_buttons[row].append(new_button)
+            else:
+                # Créer les lignes manquantes si nécessaire
+                while len(post.inline_buttons) <= row:
+                    post.inline_buttons.append([])
+                post.inline_buttons[row].append(new_button)
+            
+            # Met à jour en DB
+            result = await self.collection.update_one(
+                {"_id": ObjectId(post_id)},
+                {"$set": {
+                    "inline_buttons": post.inline_buttons,
+                    "updated_at": datetime.utcnow()
+                }}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Erreur lors de l'ajout du bouton URL: {e}")
+            return False
+    
+    async def inc_reaction(
+        self,
+        post_id: str,
+        increment: int = 1
+    ) -> bool:
+        """Incrémente le compteur de réactions"""
+        try:
+            from bson import ObjectId
+            result = await self.collection.update_one(
+                {"_id": ObjectId(post_id)},
+                {
+                    "$inc": {"reactions_count": increment},
+                    "$set": {"updated_at": datetime.utcnow()}
+                }
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Erreur lors de l'incrémentation des réactions: {e}")
+            return False
