@@ -1,0 +1,28 @@
+# Core
+python-telegram-bot==20.7
+python-dotenv==1.0.0
+
+# Database
+motor==3.3.2
+pymongo==4.6.1
+
+# Scheduler
+APScheduler==3.10.4
+
+# Optional clients
+telethon==1.33.1
+pyrogram==2.0.106
+tgcrypto==1.2.5
+
+# File operations
+Pillow==10.1.0
+opencv-python==4.8.1.78
+aiofiles==23.2.1
+
+# Utilities
+pytz==2023.3.post1
+croniter==2.0.1
+python-dateutil==2.8.2
+
+# HTTP
+httpx==0.25.2
