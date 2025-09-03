@@ -1,3 +1,36 @@
+from __future__ import annotations
+from typing import Optional
+from pyrogram import Client
+from config import Config
+from logger import setup_logger
+
+logger = setup_logger(__name__)
+
+_cfg = Config()
+_pyro: Optional[Client] = None
+_started: bool = False
+
+
+async def get_pyro_client() -> Client:
+    """
+    Retourne un client Pyrogram (mode BOT), lancé au premier usage.
+    Utilisé pour envoyer les fichiers > 50MB.
+    """
+    global _pyro, _started
+    if _pyro is None:
+        # no_updates=True = pas d'updates, juste pour envoyer
+        _pyro = Client(
+            name="uploaderbot2_pyro",
+            api_id=_cfg.API_ID,
+            api_hash=_cfg.API_HASH,
+            bot_token=_cfg.BOT_TOKEN,
+            no_updates=True,
+        )
+    if not _started:
+        await _pyro.start()
+        _started = True
+    return _pyro
+
 """
 Client Pyrogram (optionnel)
 """

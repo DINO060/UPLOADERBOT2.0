@@ -10,6 +10,7 @@ from db.repositories.posts_repo import PostsRepository
 from db.repositories.channels_repo import ChannelsRepository
 from db.motor_client import get_database
 from logger import setup_logger
+from .media_handler import send_file_smart
 
 logger = setup_logger(__name__)
 
@@ -225,30 +226,36 @@ async def send_post_to_channels(update: Update, context: ContextTypes.DEFAULT_TY
                         disable_web_page_preview=disable_web_page_preview,
                         reply_markup=inline_keyboard
                     )
-                elif post.content_type == "photo" and post.file_id:
-                    message = await context.bot.send_photo(
+                elif post.file_id:
+                    tg_file = await context.bot.get_file(post.file_id)
+                    file_path = await tg_file.download_to_drive()
+                    thumb_path = None
+                    if post.thumbnail_id:
+                        thumb_file = await context.bot.get_file(post.thumbnail_id)
+                        thumb_path = await thumb_file.download_to_drive()
+
+                    message = await send_file_smart(
+                        context_or_app=context,
                         chat_id=channel.channel_id,
-                        photo=post.file_id,
+                        file_path=file_path,
                         caption=message_text,
-                        parse_mode=parse_mode,
-                        reply_markup=inline_keyboard
+                        thumb_path=thumb_path,
+                        file_name=post.metadata.get("file_name") if getattr(post, "metadata", None) else None,
+                        is_photo=(post.content_type == "photo"),
+                        is_video=(post.content_type == "video"),
+                        force_document=(post.content_type == "document"),
+                        reply_markup=inline_keyboard,
+                        disable_notification=post.disable_notification
                     )
-                elif post.content_type == "video" and post.file_id:
-                    message = await context.bot.send_video(
-                        chat_id=channel.channel_id,
-                        video=post.file_id,
-                        caption=message_text,
-                        parse_mode=parse_mode,
-                        reply_markup=inline_keyboard
-                    )
-                elif post.content_type == "document" and post.file_id:
-                    message = await context.bot.send_document(
-                        chat_id=channel.channel_id,
-                        document=post.file_id,
-                        caption=message_text,
-                        parse_mode=parse_mode,
-                        reply_markup=inline_keyboard
-                    )
+
+                    try:
+                        import os
+                        if file_path and os.path.exists(file_path):
+                            os.remove(file_path)
+                        if thumb_path and os.path.exists(thumb_path):
+                            os.remove(thumb_path)
+                    except Exception:
+                        pass
                 else:
                     message = await context.bot.send_message(
                         chat_id=channel.channel_id,
