@@ -1,373 +1,342 @@
 """
-Module pour envoyer les posts vers les canaux
+Handler pour l'envoi de posts vers les canaux
 """
 
-from typing import Dict, List, Optional, Any
-from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.error import BadRequest, Forbidden
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+from typing import Dict, List
 
-from ..models.post import Post, PostType, PostStatus
-from ..models.channel import Channel
-from ..db.repositories.posts_repo import PostsRepository
-from ..db.repositories.channels_repo import ChannelsRepository
-from ..utils.throttling import message_throttler
-from ..logger import setup_logger
+from db.repositories.posts_repo import PostsRepository
+from db.repositories.channels_repo import ChannelsRepository
+from db.motor_client import get_database
+from logger import setup_logger
 
 logger = setup_logger(__name__)
 
 
-class PostSender:
-    """Gère l'envoi des posts vers les canaux"""
-    
-    def __init__(
-        self,
-        bot: Bot,
-        posts_repo: PostsRepository,
-        channels_repo: ChannelsRepository
-    ):
-        self.bot = bot
-        self.posts_repo = posts_repo
-        self.channels_repo = channels_repo
-    
-    async def send_post(
-        self,
-        post: Post,
-        test_mode: bool = False
-    ) -> Dict[int, int]:
-        """
-        Envoie un post vers les canaux
+async def handle_send_post(update: Update, context: ContextTypes.DEFAULT_TYPE, post_id: str = None):
+    """Gère l'envoi d'un post vers les canaux"""
+    try:
+        user_id = update.effective_user.id
         
-        Args:
-            post: Post à envoyer
-            test_mode: Si True, envoie uniquement à l'utilisateur
+        # Récupérer le post
+        db = await get_database()
+        posts_repo = PostsRepository(db)
         
-        Returns:
-            Dict channel_id -> message_id des messages envoyés
-        """
-        message_ids = {}
-        
-        try:
-            # Marquer comme en cours d'envoi
-            await self.posts_repo.update_post(
-                post._id,
-                {"status": PostStatus.PUBLISHING}
-            )
-            
-            # Préparer le markup si nécessaire
-            reply_markup = self._build_reply_markup(post)
-            
-            # Obtenir les canaux de destination
-            if test_mode:
-                # Mode test: envoyer à l'utilisateur
-                channel_ids = [post.user_id]
+        if not post_id:
+            # Si appelé depuis callback, extraire l'ID
+            if update.callback_query:
+                post_id = update.callback_query.data.split(":")[1]
             else:
-                channel_ids = post.channel_ids
-            
-            # Envoyer vers chaque canal
-            for channel_id in channel_ids:
-                try:
-                    # Vérifier que le canal est actif
-                    if not test_mode:
-                        channel = await self.channels_repo.get_channel(channel_id)
-                        if not channel or not channel.is_active:
-                            logger.warning(f"Canal {channel_id} inactif ou introuvable")
-                            continue
-                    
-                    # Throttling pour éviter le flood
-                    await message_throttler.wait_if_needed(channel_id)
-                    
-                    # Envoyer selon le type
-                    message_id = await self._send_by_type(
-                        channel_id,
-                        post,
-                        reply_markup
+                await update.message.reply_text("❌ ID du post manquant")
+                return
+        
+        post = await posts_repo.get_post(post_id)
+        if not post:
+            await update.message.reply_text("❌ Post non trouvé")
+            return
+        
+        if post.user_id != user_id:
+            await update.message.reply_text("❌ Vous ne pouvez pas envoyer ce post")
+            return
+        
+        # Récupérer les canaux de l'utilisateur
+        channels_repo = ChannelsRepository(db)
+        user_channels = await channels_repo.get_user_channels(user_id)
+        
+        if not user_channels:
+            await update.message.reply_text(
+                "❌ Aucun canal configuré.\n"
+                "Utilisez /channels pour ajouter des canaux!",
+                parse_mode="HTML"
+            )
+            return
+        
+        # Afficher la sélection des canaux
+        keyboard = build_channel_selection_keyboard(post_id, user_channels)
+        
+        await update.message.reply_text(
+            f"📤 <b>Envoi du post</b>\n\n"
+            f"🆔 <b>ID:</b> <code>{post_id}</code>\n"
+            f"📄 <b>Type:</b> {post.content_type}\n"
+            f"📢 <b>Canaux disponibles:</b> {len(user_channels)}\n\n"
+            f"<i>Sélectionnez les canaux de destination:</i>",
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+        
+    except Exception as e:
+        logger.error(f"Erreur envoi post: {e}")
+        await update.message.reply_text("❌ Erreur lors de l'envoi")
+
+
+async def toggle_channel_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère la sélection/désélection d'un canal et propose la confirmation"""
+    try:
+        query = update.callback_query
+        await query.answer()
+
+        data_parts = query.data.split(":")
+        # Expected: select_channel:POST_ID:CHANNEL_ID
+        if len(data_parts) < 3:
+            await query.answer("❌ Données invalides", show_alert=True)
+            return
+
+        post_id = data_parts[1]
+        try:
+            channel_id = int(data_parts[2])
+        except ValueError:
+            await query.answer("❌ Canal invalide", show_alert=True)
+            return
+
+        # Stockage par post pour éviter collisions
+        selection_key = f"selected_channels:{post_id}"
+        selected_channels: List[int] = context.user_data.get(selection_key, [])
+
+        if channel_id in selected_channels:
+            selected_channels.remove(channel_id)
+            await query.answer("Canal retiré de la sélection")
+        else:
+            selected_channels.append(channel_id)
+            await query.answer("Canal ajouté à la sélection")
+
+        context.user_data[selection_key] = selected_channels
+
+        # Construire UI de confirmation si au moins un canal
+        if selected_channels:
+            channels_csv = ",".join(str(cid) for cid in selected_channels)
+            confirm_keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "📤 Envoyer maintenant",
+                        callback_data=f"confirm_send:{post_id}:{channels_csv}"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Annuler",
+                        callback_data=f"cancel_send:{post_id}"
                     )
-                    
-                    if message_id:
-                        message_ids[channel_id] = message_id
-                        logger.info(f"Post envoyé au canal {channel_id}: {message_id}")
-                    
-                except (BadRequest, Forbidden) as e:
-                    logger.error(f"Erreur Telegram pour le canal {channel_id}: {e}")
-                except Exception as e:
-                    logger.error(f"Erreur lors de l'envoi au canal {channel_id}: {e}")
-            
-            # Mettre à jour le statut
-            if message_ids:
-                await self.posts_repo.mark_as_published(post._id, message_ids)
-                logger.info(f"Post {post._id} publié dans {len(message_ids)} canaux")
-            else:
-                await self.posts_repo.update_post(
-                    post._id,
-                    {"status": PostStatus.FAILED}
-                )
-                logger.error(f"Échec de la publication du post {post._id}")
-            
-        except Exception as e:
-            logger.error(f"Erreur lors de l'envoi du post: {e}")
-            await self.posts_repo.update_post(
-                post._id,
-                {"status": PostStatus.FAILED, "error": str(e)}
+                ]
+            ])
+
+            await query.edit_message_text(
+                text=(
+                    f"📢 <b>Canaux sélectionnés: {len(selected_channels)}</b>\n\n"
+                    f"Cliquez sur 'Envoyer maintenant' pour publier."
+                ),
+                parse_mode="HTML",
+                reply_markup=confirm_keyboard
             )
+        else:
+            # Si plus de sélection, ne change pas le message (l'utilisateur peut re-sélectionner)
+            pass
+
+    except Exception as e:
+        logger.error(f"Erreur sélection canal: {e}")
+        await update.callback_query.answer("❌ Erreur", show_alert=True)
+
+
+async def cancel_send_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Annule un processus d'envoi en cours"""
+    try:
+        query = update.callback_query
+        await query.answer()
+
+        # Effacer toute sélection stockée pour ce post si présent
+        data_parts = query.data.split(":")
+        post_id = data_parts[1] if len(data_parts) > 1 else None
+        if post_id:
+            selection_key = f"selected_channels:{post_id}"
+            context.user_data.pop(selection_key, None)
+
+        await query.edit_message_text(
+            "❌ <b>Envoi annulé</b>\n\nLe post n'a pas été envoyé.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Erreur cancel_send: {e}")
+        await update.callback_query.edit_message_text("❌ Erreur lors de l'annulation")
+
+async def send_to_selected_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Envoie le post vers les canaux sélectionnés"""
+    try:
+        query = update.callback_query
+        await query.answer()
         
-        return message_ids
+        # Extraire les données
+        data_parts = query.data.split(":")
+        action = data_parts[1]
+        post_id = data_parts[2]
+        channel_ids = data_parts[3].split(",") if len(data_parts) > 3 else []
+        
+        if action == "confirm_send":
+            # Envoyer vers tous les canaux sélectionnés
+            await send_post_to_channels(update, context, post_id, channel_ids)
+        else:
+            await query.edit_message_text("❌ Action non reconnue")
+            
+    except Exception as e:
+        logger.error(f"Erreur envoi vers canaux: {e}")
+        await update.callback_query.edit_message_text("❌ Erreur lors de l'envoi")
+
+
+async def send_post_to_channels(update: Update, context: ContextTypes.DEFAULT_TYPE, post_id: str, channel_ids: List[str]):
+    """Envoie effectivement le post vers les canaux"""
+    try:
+        db = await get_database()
+        posts_repo = PostsRepository(db)
+        channels_repo = ChannelsRepository(db)
+        
+        # Récupérer le post
+        post = await posts_repo.get_post(post_id)
+        if not post:
+            await update.callback_query.edit_message_text("❌ Post non trouvé")
+            return
+        
+        # Récupérer les canaux
+        channels = []
+        for channel_id in channel_ids:
+            channel = await channels_repo.get_channel(channel_id)
+            if channel:
+                channels.append(channel)
+        
+        if not channels:
+            await update.callback_query.edit_message_text("❌ Aucun canal valide")
+            return
+        
+        # Préparer le message
+        message_text = post.text or post.caption or ""
+        parse_mode = post.parse_mode or "HTML"
+        disable_web_page_preview = post.disable_web_page_preview
+        
+        # Construire le clavier avec réactions et boutons
+        inline_keyboard = build_post_keyboard(post)
+        
+        # Envoyer vers chaque canal
+        sent_messages = {}
+        failed_channels = []
+        
+        for channel in channels:
+            try:
+                if post.content_type == "text":
+                    message = await context.bot.send_message(
+                        chat_id=channel.channel_id,
+                        text=message_text,
+                        parse_mode=parse_mode,
+                        disable_web_page_preview=disable_web_page_preview,
+                        reply_markup=inline_keyboard
+                    )
+                elif post.content_type == "photo" and post.file_id:
+                    message = await context.bot.send_photo(
+                        chat_id=channel.channel_id,
+                        photo=post.file_id,
+                        caption=message_text,
+                        parse_mode=parse_mode,
+                        reply_markup=inline_keyboard
+                    )
+                elif post.content_type == "video" and post.file_id:
+                    message = await context.bot.send_video(
+                        chat_id=channel.channel_id,
+                        video=post.file_id,
+                        caption=message_text,
+                        parse_mode=parse_mode,
+                        reply_markup=inline_keyboard
+                    )
+                elif post.content_type == "document" and post.file_id:
+                    message = await context.bot.send_document(
+                        chat_id=channel.channel_id,
+                        document=post.file_id,
+                        caption=message_text,
+                        parse_mode=parse_mode,
+                        reply_markup=inline_keyboard
+                    )
+                else:
+                    message = await context.bot.send_message(
+                        chat_id=channel.channel_id,
+                        text=message_text,
+                        parse_mode=parse_mode,
+                        reply_markup=inline_keyboard
+                    )
+                
+                # Sauvegarder le message envoyé
+                sent_messages[channel.channel_id] = message.message_id
+                
+                # Mettre à jour le statut en DB
+                await posts_repo.add_sent_message(post_id, channel.channel_id, message.message_id)
+                
+            except Exception as e:
+                logger.error(f"Erreur envoi vers {channel.channel_id}: {e}")
+                failed_channels.append(channel.channel_id)
+        
+        # Mettre à jour le statut du post
+        if sent_messages:
+            await posts_repo.set_status(post_id, "sent")
+        
+        # Afficher le résultat
+        success_count = len(sent_messages)
+        failed_count = len(failed_channels)
+        
+        result_text = (
+            f"📤 <b>Envoi terminé!</b>\n\n"
+            f"✅ <b>Envoyé avec succès:</b> {success_count} canal(x)\n"
+        )
+        
+        if failed_count > 0:
+            result_text += f"❌ <b>Échecs:</b> {failed_count} canal(x)\n"
+        
+        result_text += f"\n🆔 <b>Post ID:</b> <code>{post_id}</code>"
+        
+        await update.callback_query.edit_message_text(
+            result_text,
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        logger.error(f"Erreur envoi multi-canaux: {e}")
+        await update.callback_query.edit_message_text("❌ Erreur lors de l'envoi")
+
+
+def build_channel_selection_keyboard(post_id: str, channels: List) -> InlineKeyboardMarkup:
+    """Construit le clavier de sélection des canaux"""
+    keyboard = []
     
-    async def _send_by_type(
-        self,
-        chat_id: int,
-        post: Post,
-        reply_markup: Optional[InlineKeyboardMarkup]
-    ) -> Optional[int]:
-        """
-        Envoie selon le type de post
-        
-        Args:
-            chat_id: ID du chat/canal
-            post: Post à envoyer
-            reply_markup: Boutons inline
-        
-        Returns:
-            ID du message envoyé
-        """
-        try:
-            message = None
-            
-            if post.content_type == PostType.TEXT:
-                message = await self.bot.send_message(
-                    chat_id=chat_id,
-                    text=post.text,
-                    parse_mode=post.parse_mode,
-                    disable_notification=post.disable_notification,
-                    disable_web_page_preview=post.disable_web_page_preview,
-                    protect_content=post.protect_content,
-                    reply_markup=reply_markup
-                )
-            
-            elif post.content_type == PostType.PHOTO:
-                message = await self.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=post.file_id,
-                    caption=post.caption,
-                    parse_mode=post.parse_mode,
-                    disable_notification=post.disable_notification,
-                    protect_content=post.protect_content,
-                    reply_markup=reply_markup
-                )
-            
-            elif post.content_type == PostType.VIDEO:
-                message = await self.bot.send_video(
-                    chat_id=chat_id,
-                    video=post.file_id,
-                    caption=post.caption,
-                    parse_mode=post.parse_mode,
-                    disable_notification=post.disable_notification,
-                    protect_content=post.protect_content,
-                    reply_markup=reply_markup
-                )
-            
-            elif post.content_type == PostType.AUDIO:
-                message = await self.bot.send_audio(
-                    chat_id=chat_id,
-                    audio=post.file_id,
-                    caption=post.caption,
-                    parse_mode=post.parse_mode,
-                    disable_notification=post.disable_notification,
-                    protect_content=post.protect_content,
-                    reply_markup=reply_markup
-                )
-            
-            elif post.content_type == PostType.DOCUMENT:
-                message = await self.bot.send_document(
-                    chat_id=chat_id,
-                    document=post.file_id,
-                    caption=post.caption,
-                    parse_mode=post.parse_mode,
-                    disable_notification=post.disable_notification,
-                    protect_content=post.protect_content,
-                    reply_markup=reply_markup
-                )
-            
-            elif post.content_type == PostType.ANIMATION:
-                message = await self.bot.send_animation(
-                    chat_id=chat_id,
-                    animation=post.file_id,
-                    caption=post.caption,
-                    parse_mode=post.parse_mode,
-                    disable_notification=post.disable_notification,
-                    protect_content=post.protect_content,
-                    reply_markup=reply_markup
-                )
-            
-            elif post.content_type == PostType.VOICE:
-                message = await self.bot.send_voice(
-                    chat_id=chat_id,
-                    voice=post.file_id,
-                    caption=post.caption,
-                    parse_mode=post.parse_mode,
-                    disable_notification=post.disable_notification,
-                    protect_content=post.protect_content,
-                    reply_markup=reply_markup
-                )
-            
-            elif post.content_type == PostType.VIDEO_NOTE:
-                message = await self.bot.send_video_note(
-                    chat_id=chat_id,
-                    video_note=post.file_id,
-                    disable_notification=post.disable_notification,
-                    protect_content=post.protect_content,
-                    reply_markup=reply_markup
-                )
-            
-            elif post.content_type == PostType.MEDIA_GROUP:
-                # Pour les media groups, on doit construire la liste des médias
-                media = await self._build_media_group(post)
-                messages = await self.bot.send_media_group(
-                    chat_id=chat_id,
-                    media=media,
-                    disable_notification=post.disable_notification,
-                    protect_content=post.protect_content
-                )
-                # Retourner l'ID du premier message
-                if messages:
-                    message = messages[0]
-            
-            return message.message_id if message else None
-        
-        except Exception as e:
-            logger.error(f"Erreur lors de l'envoi du message: {e}")
-            return None
+    # Boutons pour chaque canal
+    for channel in channels:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"📢 {channel.title or channel.channel_id}",
+                callback_data=f"select_channel:{post_id}:{channel.channel_id}"
+            )
+        ])
     
-    async def _build_media_group(self, post: Post) -> List[Any]:
-        """
-        Construit un media group
-        
-        Args:
-            post: Post contenant les médias
-        
-        Returns:
-            Liste des InputMedia
-        """
-        from telegram import InputMediaPhoto, InputMediaVideo, InputMediaDocument
-        
-        media = []
-        
-        for i, file_id in enumerate(post.file_ids):
-            # Déterminer le type (simplifié, peut être amélioré)
-            # En production, on devrait stocker le type de chaque fichier
-            
-            # Ajouter la légende seulement au premier élément
-            caption = post.caption if i == 0 else None
-            parse_mode = post.parse_mode if i == 0 else None
-            
-            # Par défaut, on considère que c'est une photo
-            # À améliorer avec une vraie détection du type
-            media.append(InputMediaPhoto(
-                media=file_id,
-                caption=caption,
-                parse_mode=parse_mode
-            ))
-        
-        return media
+    # Boutons d'action
+    keyboard.append([
+        InlineKeyboardButton("✅ Envoyer à tous", callback_data=f"confirm_send:{post_id}:all"),
+        InlineKeyboardButton("❌ Annuler", callback_data=f"cancel_send:{post_id}")
+    ])
     
-    def _build_reply_markup(self, post: Post) -> Optional[InlineKeyboardMarkup]:
-        """
-        Construit le markup des boutons inline
-        
-        Args:
-            post: Post contenant les boutons
-        
-        Returns:
-            InlineKeyboardMarkup ou None
-        """
-        if not post.inline_buttons:
-            return None
-        
-        keyboard = []
-        
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_post_keyboard(post) -> InlineKeyboardMarkup:
+    """Construit le clavier final du post avec réactions et boutons"""
+    keyboard = []
+    
+    # Ajouter les boutons URL existants
+    if post.inline_buttons:
         for row in post.inline_buttons:
-            button_row = []
-            for button_data in row:
-                button = InlineKeyboardButton(
-                    text=button_data.get("text", "Button"),
-                    url=button_data.get("url"),
-                    callback_data=button_data.get("callback_data")
-                )
-                button_row.append(button)
-            
-            if button_row:
-                keyboard.append(button_row)
-        
-        return InlineKeyboardMarkup(keyboard) if keyboard else None
+            keyboard.append(row)
     
-    async def edit_post(
-        self,
-        chat_id: int,
-        message_id: int,
-        post: Post
-    ) -> bool:
-        """
-        Édite un post existant
-        
-        Args:
-            chat_id: ID du chat/canal
-            message_id: ID du message
-            post: Post avec les nouvelles données
-        
-        Returns:
-            True si édité avec succès
-        """
-        try:
-            reply_markup = self._build_reply_markup(post)
-            
-            if post.content_type == PostType.TEXT:
-                await self.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=post.text,
-                    parse_mode=post.parse_mode,
-                    disable_web_page_preview=post.disable_web_page_preview,
-                    reply_markup=reply_markup
+    # Ajouter les réactions populaires
+    if post.reactions:
+        reaction_row = []
+        for reaction in post.reactions[:8]:  # Limiter à 8 réactions
+            reaction_row.append(
+                InlineKeyboardButton(
+                    reaction,
+                    callback_data=f"react:{reaction}:{post._id}"
                 )
-            else:
-                # Pour les médias, on ne peut éditer que la légende
-                await self.bot.edit_message_caption(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    caption=post.caption,
-                    parse_mode=post.parse_mode,
-                    reply_markup=reply_markup
-                )
-            
-            logger.info(f"Post édité: {chat_id}/{message_id}")
-            return True
-        
-        except Exception as e:
-            logger.error(f"Erreur lors de l'édition: {e}")
-            return False
-    
-    async def delete_post(
-        self,
-        chat_id: int,
-        message_id: int
-    ) -> bool:
-        """
-        Supprime un post
-        
-        Args:
-            chat_id: ID du chat/canal
-            message_id: ID du message
-        
-        Returns:
-            True si supprimé
-        """
-        try:
-            await self.bot.delete_message(
-                chat_id=chat_id,
-                message_id=message_id
             )
-            logger.info(f"Post supprimé: {chat_id}/{message_id}")
-            return True
-        
-        except Exception as e:
-            logger.error(f"Erreur lors de la suppression: {e}")
-            return False
+        if reaction_row:
+            keyboard.append(reaction_row)
+    
+    return InlineKeyboardMarkup(keyboard) if keyboard else None

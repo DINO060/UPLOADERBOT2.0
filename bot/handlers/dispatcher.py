@@ -5,10 +5,11 @@ Dispatcher central pour enregistrer tous les handlers
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 
 from .start import get_start_handler
+from . import cancel, channels
 from ..logger import setup_logger
 
 # Import des handlers de publications
-from ..publications import receive_post
+from ..publications import receive_post, preview_post, send_post, add_reactions, add_url_buttons
 
 logger = setup_logger(__name__)
 
@@ -24,20 +25,49 @@ def register_handlers(app: Application):
         # ============ Handlers de commandes ============
         app.add_handler(get_start_handler())
         app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(CommandHandler("cancel", cancel_command))
+        app.add_handler(CommandHandler("cancel", cancel.handle_cancel_command))
         app.add_handler(CommandHandler("settings", settings_command))
         
         # Commandes pour les posts
         app.add_handler(CommandHandler("drafts", show_drafts))
-        app.add_handler(CommandHandler("send", send_post))
+        app.add_handler(CommandHandler("send", send_post_command))
         app.add_handler(CommandHandler("delete", delete_post))
-        app.add_handler(CommandHandler("channels", manage_channels))
+        app.add_handler(CommandHandler("channels", channels.handle_channels_command))
+        app.add_handler(CommandHandler("preview", preview_post.handle_preview_command))
+        
+        # Commandes pour les réactions et boutons
+        app.add_handler(CommandHandler("add_reaction", add_reactions.handle_add_reaction_command))
+        app.add_handler(add_url_buttons.get_add_button_conversation_handler())
         
         # ============ Handlers de callback queries ============
         app.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu:"))
+        # Annulations via callback générique
+        app.add_handler(CallbackQueryHandler(cancel.handle_cancel_callback, pattern="^cancel$"))
+        app.add_handler(CallbackQueryHandler(cancel.handle_cancel_send, pattern="^cancel_send$"))
         app.add_handler(CallbackQueryHandler(settings_callback, pattern="^settings:"))
         app.add_handler(CallbackQueryHandler(draft_callback, pattern="^draft:"))
-        app.add_handler(CallbackQueryHandler(channel_callback, pattern="^channel:"))
+        # Canaux
+        app.add_handler(channels.get_channels_conversation_handler())
+        app.add_handler(CallbackQueryHandler(channels.handle_manage_channel, pattern="^manage_channel:"))
+        app.add_handler(CallbackQueryHandler(channels.handle_toggle_channel, pattern="^toggle_channel:"))
+        app.add_handler(CallbackQueryHandler(channels.handle_delete_channel, pattern="^delete_channel:"))
+        app.add_handler(CallbackQueryHandler(channels.handle_confirm_delete_channel, pattern="^confirm_delete_channel:"))
+        app.add_handler(CallbackQueryHandler(channels.handle_refresh_channels, pattern="^refresh_channels$"))
+        app.add_handler(CallbackQueryHandler(channels.handle_channel_help, pattern="^channel_help$"))
+        
+        # ============ Handlers de publications (PRIORITÉ 3) ============
+        # Envoi de posts
+        app.add_handler(CallbackQueryHandler(send_post.send_to_selected_channels, pattern="^confirm_send:"))
+        app.add_handler(CallbackQueryHandler(send_post.handle_send_post, pattern="^send:"))
+        app.add_handler(CallbackQueryHandler(send_post.toggle_channel_selection, pattern="^select_channel:"))
+        app.add_handler(CallbackQueryHandler(send_post.cancel_send_callback, pattern="^cancel_send:"))
+        
+        # Réactions (pattern: react:emoji:post_id)
+        app.add_handler(CallbackQueryHandler(add_reactions.handle_reaction_callback, pattern="^react:"))
+        app.add_handler(CallbackQueryHandler(add_reactions.show_reactions_menu, pattern="^reactions:"))
+        
+        # Boutons URL
+        app.add_handler(CallbackQueryHandler(add_url_buttons.handle_buttons_menu, pattern="^buttons:"))
         
         # ============ Handlers de réception de posts (PRIORITÉ 2) ============
         # IMPORTANT: Les media_group doivent être traités en premier
@@ -105,8 +135,12 @@ async def help_command(update, context):
         "• Le bot créera automatiquement un draft\n\n"
         "<b>📤 Gestion des posts:</b>\n"
         "/drafts - Voir vos drafts\n"
+        "/preview - Prévisualiser le dernier draft\n"
         "/send <code>ID</code> - Envoyer un post\n"
         "/delete <code>ID</code> - Supprimer un post\n\n"
+        "<b>👍 Réactions et boutons:</b>\n"
+        "/add_reaction <code>ID</code> <code>EMOJI</code> - Ajouter une réaction\n"
+        "/add_button <code>ID</code> - Ajouter un bouton URL\n\n"
         "<b>📢 Gestion des canaux:</b>\n"
         "/channels - Gérer vos canaux\n\n"
         "<b>⚙️ Autres commandes:</b>\n"
@@ -130,7 +164,8 @@ async def settings_command(update, context):
         "⚙️ <b>Paramètres</b>\n\n"
         "• Timezone: UTC\n"
         "• Auto-delete: 24h\n"
-        "• Reactions: ✅\n\n"
+        "• Reactions: ✅\n"
+        "• Boutons URL: ✅\n\n"
         "<i>Paramètres avancés en construction...</i>",
         parse_mode="HTML"
     )
@@ -187,8 +222,8 @@ async def show_drafts(update, context):
         await update.message.reply_text("❌ Erreur lors de la récupération des drafts")
 
 
-async def send_post(update, context):
-    """Envoie un post (placeholder)"""
+async def send_post_command(update, context):
+    """Commande /send pour envoyer un post"""
     if not context.args:
         await update.message.reply_text(
             "Usage: /send <code>POST_ID</code>",
@@ -197,10 +232,7 @@ async def send_post(update, context):
         return
     
     post_id = context.args[0]
-    await update.message.reply_text(
-        f"📤 Envoi du post <code>{post_id}</code> (en construction...)",
-        parse_mode="HTML"
-    )
+    await send_post.handle_send_post(update, context, post_id)
 
 
 async def delete_post(update, context):
@@ -252,6 +284,11 @@ async def menu_callback(update, context):
     elif action == "drafts":
         # Trigger show_drafts
         await show_drafts(query, context)
+    elif action == "preview":
+        await query.edit_message_text(
+            "📝 Utilisez /preview pour prévisualiser votre dernier draft",
+            parse_mode="HTML"
+        )
     elif action == "settings":
         await query.edit_message_text("⚙️ Paramètres (en construction)")
 
@@ -275,10 +312,7 @@ async def draft_callback(update, context):
     post_id = data_parts[2] if len(data_parts) > 2 else None
     
     if action == "send" and post_id:
-        await query.edit_message_text(
-            f"📤 Envoi du post {post_id} (en construction...)",
-            parse_mode="HTML"
-        )
+        await send_post.handle_send_post(update, context, post_id)
     elif action == "edit" and post_id:
         await query.edit_message_text(
             f"✏️ Édition du post {post_id} (en construction...)",
@@ -289,9 +323,8 @@ async def draft_callback(update, context):
             f"🗑️ Suppression du post {post_id} (en construction...)",
             parse_mode="HTML"
         )
+    elif action == "preview" and post_id:
+        await preview_post.handle_preview_command(update, context)
 
 
-async def channel_callback(update, context):
-    """Gère les callbacks des canaux"""
-    query = update.callback_query
-    await query.answer("Gestion des canaux en construction")
+# Placeholder supprimé: la gestion des canaux est couverte par bot/handlers/channels.py

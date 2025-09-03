@@ -16,9 +16,9 @@ def main():
         # Configuration
         config = Config()
         
-        # ⚠️ Mode test : DB & scheduler désactivés
-        logger.info("⚠️ Mode test : MongoDB désactivé temporairement")
-        logger.info("⚠️ Scheduler désactivé en mode test")
+        # Mode test : DB & scheduler désactivés
+        logger.info("Mode test : MongoDB desactive temporairement")
+        logger.info("Scheduler desactive en mode test")
         
         # Création de l'application PTB
         app = (
@@ -30,16 +30,16 @@ def main():
         
         # Enregistrer les handlers
         register_handlers(app)
-        logger.info("✅ Handlers enregistrés")
+        logger.info("Handlers enregistres")
         
         # Lancer le bot
-        logger.info("🤖 Démarrage du bot...")
+        logger.info("Demarrage du bot...")
         app.run_polling(drop_pending_updates=True)
         
     except KeyboardInterrupt:
-        logger.info("⏸️ Arrêt du bot...")
+        logger.info("Arret du bot...")
     except Exception as e:
-        logger.error(f"❌ Erreur fatale: {e}")
+        logger.error(f"Erreur fatale: {e}")
         raise
 
 if __name__ == "__main__":
